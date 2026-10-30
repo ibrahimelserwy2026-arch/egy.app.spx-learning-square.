@@ -84,12 +84,7 @@ def extract_only_correct_ids(result_response_text):
     return correct_ids_only
 
 def process_test_perfect_score(item_id, cookies_dict):
-    """
-    تتابع حل الاختبار بالترتيب الصحيح:
-    1. start (المحاولة الأولى) -> 2. submit (فارغ) 
-    3. history -> result (سحب الإجابات الصح)
-    4. start (المحاولة الثانية) -> 5. PUT answer لكل سؤال بالترتيب -> 6. submit النهائي
-    """
+
     start_url = f"https://egy.app.spx-learning-square.com/api/v1/tests/{item_id}/start"
     submit_url = f"https://egy.app.spx-learning-square.com/api/v1/tests/{item_id}/submit"
     history_url = f"https://egy.app.spx-learning-square.com/api/v1/tests/{item_id}/history"
@@ -435,8 +430,6 @@ def main(id, password):
 def my_function(user, password):
     main(user, password)
 
-    return
-
 
 class MyApp(App):
 
@@ -498,8 +491,6 @@ class MyApp(App):
 
         # إرسال القيم إلى الدالة المطلوبة
         result = my_function(user, password)
-
-        self.result.text = str(result)
 
 
 if __name__ == "__main__":
