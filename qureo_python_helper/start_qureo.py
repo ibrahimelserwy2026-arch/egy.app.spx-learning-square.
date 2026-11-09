@@ -15,6 +15,8 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
 
 
 BASE_URL = "https://me-tp.qureo.education"
@@ -118,6 +120,43 @@ def load_lecture(lecture_id: int, cookie_header: str) -> dict[str, Any]:
     if not isinstance(data, dict) or not isinstance(data.get("talks"), list):
         raise ValueError("محتوى الدرس لا يحتوي على talks بالشكل المتوقع.")
     return data
+
+
+def put_json(
+    path: str,
+    cookie_header: str,
+    referer: str,
+    payload: dict[str, Any],
+) -> tuple[int, Any]:
+    """Send one user-approved answer to QUREO and return its HTTP result."""
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": BASE_URL,
+        "Cookie": cookie_header,
+        "Referer": referer,
+        "User-Agent": USER_AGENT,
+    }
+    response = requests.put(
+        f"{BASE_URL}{path}",
+        headers=headers,
+        json=payload,
+        timeout=25,
+    )
+    if response.status_code in (401, 403):
+        raise PermissionError(
+            "جلسة QUREO غير صالحة أو انتهت. حدّث Cookie من المتصفح."
+        )
+    try:
+        body: Any = response.json()
+    except ValueError:
+        body = response.text
+    if not response.ok:
+        raise requests.HTTPError(
+            f"QUREO HTTP {response.status_code}: {str(body)[:1200]}",
+            response=response,
+        )
+    return response.status_code, body
 
 
 def clean_text(value: Any) -> str:
@@ -420,11 +459,143 @@ def format_lecture(
         "",
         "=" * 66,
         f"عدد الأسئلة المكتشفة: {question_number}",
-        "تم تجهيز الحلول المقترحة محليًا. لم يتم إرسال إجابات إلى QUREO "
-        "ولم يتم استدعاء endpoint إكمال الدرس أو الاختبار.",
+        "تم تجهيز الإجابات المقترحة. استخدم زر إرسال السؤال بعد مراجعة الحل.",
         "=" * 66,
     ])
     return "\n".join(lines)
+
+
+def prepare_submission_questions(
+    payload: dict[str, Any],
+    api_key: str,
+    model: str,
+) -> list[dict[str, Any]]:
+    """Prepare editable answers from QUREO model answers/placeholders."""
+    prepared: list[dict[str, Any]] = []
+    for talk in payload.get("talks") or []:
+        if not isinstance(talk, dict) or not talk.get("id"):
+            continue
+        body = talk.get("body") or {}
+        talk_type = talk.get("type")
+        question = body.get("question")
+        question_text = (
+            question.get("text", "")
+            if isinstance(question, dict)
+            else str(question or "")
+        )
+        base = {
+            "talk_id": str(talk["id"]),
+            "question_text": clean_text(question_text),
+        }
+
+        if talk_type == "choice_question":
+            choices = [
+                item for item in (body.get("choices") or [])
+                if isinstance(item, dict)
+            ]
+            if not choices:
+                continue
+            correct = next(
+                (
+                    item for item in choices
+                    if item.get("is_correct") is True
+                    or item.get("correct") is True
+                    or item.get("isCorrect") is True
+                ),
+                None,
+            )
+            answer_value = str(correct.get("value", "")) if correct else ""
+            source = "إجابة محددة صراحةً في بيانات السؤال"
+            if not answer_value and api_key.strip():
+                try:
+                    suggestion = suggest_choice(
+                        question_text, choices, api_key, model
+                    )
+                    match = re.search(r"\[value=(.*?)\]", suggestion)
+                    if match:
+                        answer_value = match.group(1).strip()
+                        source = "اقتراح تحليلي من OpenAI؛ راجعه قبل الإرسال"
+                except Exception:
+                    pass
+            if not answer_value:
+                answer_value = str(choices[0].get("value", ""))
+                source = "لا توجد علامة إجابة صحيحة؛ راجع الاختيار قبل الإرسال"
+            base.update({
+                "kind": "choice",
+                "lang": "",
+                "answer": answer_value,
+                "answer_source": source,
+                "choices": [
+                    {
+                        "label": clean_text(item.get("label", "")),
+                        "value": str(item.get("value", "")),
+                    }
+                    for item in choices
+                ],
+            })
+            prepared.append(base)
+            continue
+
+        if talk_type != "try":
+            continue
+        codes = [
+            item for item in (body.get("codes") or [])
+            if isinstance(item, dict)
+        ]
+        if not codes:
+            continue
+        code_item = codes[0]
+        language = str(code_item.get("lang") or "python")
+        placeholders = [
+            item for item in (code_item.get("placeholders") or [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        is_partial = body.get("editor_type") == "part" or bool(placeholders)
+
+        if is_partial:
+            partial_answers = []
+            for part in placeholders:
+                answer = (
+                    part.get("model_answer")
+                    or part.get("alternative_code")
+                    or part.get("default_code")
+                )
+                if answer is not None:
+                    partial_answers.append({
+                        "name": str(part["name"]),
+                        "code": str(answer),
+                    })
+            if not partial_answers:
+                continue
+            base.update({
+                "kind": "try_partial",
+                "lang": language,
+                "answers": partial_answers,
+                "answer_source": "إجابات placeholders المرفقة في بيانات QUREO",
+            })
+        else:
+            answer = code_item.get("model_answer")
+            source = "الإجابة النموذجية المرفقة في بيانات QUREO"
+            if not answer:
+                try:
+                    answer, explanation = suggest_code(
+                        question_text,
+                        code_item,
+                        body.get("hints") or [],
+                        api_key,
+                        model,
+                    )
+                    source = "اقتراح مولّد؛ راجعه قبل الإرسال"
+                except Exception:
+                    continue
+            base.update({
+                "kind": "try",
+                "lang": language,
+                "answer": str(answer),
+                "answer_source": source,
+            })
+        prepared.append(base)
+    return prepared
 
 
 def scan_latest(cookie_header: str, section_id: int) -> tuple[str, int | None]:
@@ -570,24 +741,33 @@ class QureOHelperApp(App):
         self.output = TextInput(
             text=(
                 "اضغط «فحص التقدم وحل آخر درس» لقراءة آخر Chapter وLecture "
-                "واستخراج الإجابات النموذجية أو اقتراح حلول للأسئلة."
+                "وتجهيز إجابات الأسئلة."
             ),
             multiline=True,
             readonly=True,
-            size_hint_y=1,
-            font_size=sp(13),
+            size_hint_y=0.30,
+            font_size=sp(12),
         )
         root.add_widget(self.output)
 
         root.add_widget(Label(
-            text=(
-                "مساعد الحل لا يرسل إجابات أو ينهي الدرس/الاختبار. "
-                "راجع الاقتراحات وأدخل إجاباتك بنفسك على المنصة."
-            ),
+            text="راجع كل إجابة ثم اضغط زر إرسال الخاص بالسؤال.",
             font_size=sp(12),
             size_hint_y=None,
-            height=dp(38),
+            height=dp(28),
         ))
+        self.questions_scroll = ScrollView(size_hint_y=0.70)
+        self.questions_layout = GridLayout(
+            cols=1,
+            spacing=dp(8),
+            padding=dp(4),
+            size_hint_y=None,
+        )
+        self.questions_layout.bind(
+            minimum_height=self.questions_layout.setter("height")
+        )
+        self.questions_scroll.add_widget(self.questions_layout)
+        root.add_widget(self.questions_scroll)
         return root
 
     def _get_inputs(self) -> tuple[str, int, str, str]:
@@ -629,8 +809,11 @@ class QureOHelperApp(App):
                 return
             payload = load_lecture(lecture_id, cookie)
             output = report + "\n\n" + format_lecture(payload, api_key, model)
+            questions = prepare_submission_questions(payload, api_key, model)
             Clock.schedule_once(
-                lambda _dt: self._finish("تم تحليل الدرس وتجهيز الحلول", output), 0
+                lambda _dt: self._finish_and_show_questions(
+                    "تم تحليل الدرس وتجهيز الإجابات", output, questions
+                ), 0
             )
         except Exception as exc:
             message = self._friendly_error(exc)
@@ -660,14 +843,220 @@ class QureOHelperApp(App):
         try:
             payload = load_lecture(lecture_id, cookie)
             output = format_lecture(payload, api_key, model)
+            questions = prepare_submission_questions(payload, api_key, model)
             Clock.schedule_once(
-                lambda _dt: self._finish("تم تحميل الدرس وتجهيز الحلول", output), 0
+                lambda _dt: self._finish_and_show_questions(
+                    "تم تحميل الدرس وتجهيز الإجابات", output, questions
+                ), 0
             )
         except Exception as exc:
             message = self._friendly_error(exc)
             Clock.schedule_once(
                 lambda _dt: self._finish("تعذر تحميل الدرس", message), 0
             )
+
+    def _finish_and_show_questions(
+        self,
+        status: str,
+        output: str,
+        questions: list[dict[str, Any]],
+    ):
+        self._finish(status, output)
+        self._display_questions(questions)
+
+    def _display_questions(self, questions: list[dict[str, Any]]):
+        self.questions_layout.clear_widgets()
+        if not questions:
+            self.questions_layout.add_widget(Label(
+                text=(
+                    "لم يتم تجهيز إجابات قابلة للإرسال. "
+                    "قد لا يحتوي الدرس على model_answer أو placeholders."
+                ),
+                size_hint_y=None,
+                height=dp(55),
+            ))
+            return
+
+        for number, question in enumerate(questions, start=1):
+            card = BoxLayout(
+                orientation="vertical",
+                spacing=dp(5),
+                padding=dp(8),
+                size_hint_y=None,
+            )
+            card.bind(minimum_height=card.setter("height"))
+            header = Label(
+                text=(
+                    f"السؤال {number} | Talk ID: {question['talk_id']} "
+                    f"| {question['kind']}"
+                ),
+                size_hint_y=None,
+                height=dp(30),
+            )
+            card.add_widget(header)
+
+            prompt = TextInput(
+                text=question.get("question_text") or "سؤال بدون نص",
+                readonly=True,
+                multiline=True,
+                size_hint_y=None,
+                height=dp(72),
+                font_size=sp(12),
+            )
+            card.add_widget(prompt)
+
+            source = Label(
+                text="مصدر الإجابة: " + question.get("answer_source", "غير محدد"),
+                size_hint_y=None,
+                height=dp(28),
+                font_size=sp(11),
+            )
+            card.add_widget(source)
+
+            answer_fields: list[tuple[str, TextInput]] = []
+            if question["kind"] == "try_partial":
+                for part in question.get("answers") or []:
+                    card.add_widget(Label(
+                        text=f"الجزء: {part['name']}",
+                        size_hint_y=None,
+                        height=dp(24),
+                    ))
+                    field = TextInput(
+                        text=part["code"],
+                        multiline=True,
+                        size_hint_y=None,
+                        height=dp(65),
+                        font_size=sp(12),
+                    )
+                    answer_fields.append((part["name"], field))
+                    card.add_widget(field)
+            elif question["kind"] == "choice":
+                options_text = "\n".join(
+                    f"{item['label']}  [value={item['value']}]"
+                    for item in question.get("choices") or []
+                )
+                card.add_widget(Label(
+                    text=options_text,
+                    size_hint_y=None,
+                    height=dp(max(35, min(100, 22 * len(question.get("choices") or [])))),
+                    font_size=sp(11),
+                ))
+                field = TextInput(
+                    text=str(question.get("answer") or ""),
+                    hint_text="قيمة الاختيار value",
+                    multiline=False,
+                    size_hint_y=None,
+                    height=dp(42),
+                    font_size=sp(13),
+                )
+                answer_fields.append(("value", field))
+                card.add_widget(field)
+            else:
+                field = TextInput(
+                    text=str(question.get("answer") or ""),
+                    multiline=True,
+                    size_hint_y=None,
+                    height=dp(145),
+                    font_size=sp(12),
+                )
+                answer_fields.append(("answer", field))
+                card.add_widget(field)
+
+            send_button = Button(
+                text="إرسال إجابة هذا السؤال إلى QUREO",
+                size_hint_y=None,
+                height=dp(44),
+            )
+            send_button.bind(
+                on_release=lambda _btn, q=question, fields=answer_fields, b=send_button:
+                    self.start_send_question(q, fields, b)
+            )
+            card.add_widget(send_button)
+            self.questions_layout.add_widget(card)
+
+    def start_send_question(
+        self,
+        question: dict[str, Any],
+        answer_fields: list[tuple[str, TextInput]],
+        button: Button,
+    ):
+        try:
+            cookie = normalize_cookie(self.cookie_input.text)
+            if not cookie:
+                raise ValueError("أدخل Cookie الحالية أولًا.")
+            kind = question["kind"]
+            if kind == "choice":
+                value = answer_fields[0][1].text.strip()
+                if not value:
+                    raise ValueError("اكتب قيمة الاختيار قبل الإرسال.")
+                body = {"choice_question": {"value": value}}
+            elif kind == "try_partial":
+                answers = [
+                    {"name": name, "code": field.text}
+                    for name, field in answer_fields
+                ]
+                if not answers or any(not item["code"].strip() for item in answers):
+                    raise ValueError("أكمل كل أجزاء الكود قبل الإرسال.")
+                body = {
+                    "try_partial": {
+                        "lang": question["lang"],
+                        "answers": answers,
+                    }
+                }
+            else:
+                answer = answer_fields[0][1].text
+                if not answer.strip():
+                    raise ValueError("اكتب كود الإجابة قبل الإرسال.")
+                body = {
+                    "try": {
+                        "lang": question["lang"],
+                        "answer": answer,
+                    }
+                }
+            request_body = {"value": body}
+        except (KeyError, IndexError, ValueError) as exc:
+            self.status.text = str(exc)
+            return
+
+        button.disabled = True
+        self.status.text = f"جارٍ إرسال إجابة Talk {question['talk_id']}..."
+        threading.Thread(
+            target=self._send_worker,
+            args=(cookie, question["talk_id"], request_body, button),
+            daemon=True,
+        ).start()
+
+    def _send_worker(
+        self,
+        cookie: str,
+        talk_id: str,
+        request_body: dict[str, Any],
+        button: Button,
+    ):
+        try:
+            status_code, result = put_json(
+                f"/api/study/students/lecture-talks/{talk_id}",
+                cookie,
+                f"{BASE_URL}/",
+                request_body,
+            )
+            message = (
+                f"تم إرسال إجابة Talk {talk_id} | HTTP {status_code}\n"
+                + json.dumps(result, ensure_ascii=False, indent=2)[:3500]
+            )
+            Clock.schedule_once(
+                lambda _dt: self._send_finished(button, "تم الإرسال", message), 0
+            )
+        except Exception as exc:
+            message = self._friendly_error(exc)
+            Clock.schedule_once(
+                lambda _dt: self._send_finished(button, "فشل الإرسال", message), 0
+            )
+
+    def _send_finished(self, button: Button, status: str, message: str):
+        button.disabled = False
+        self.status.text = status
+        self.output.text = (self.output.text + "\n\n" + message)[-12000:]
 
     @staticmethod
     def _friendly_error(exc: Exception) -> str:
