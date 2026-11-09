@@ -97,9 +97,15 @@ class ArabicLabel(Label):
         self.bind(text=self._shape_updated_text)
 
     def _shape_updated_text(self, _instance, value):
+        if getattr(self, "_updating_arabic_text", False):
+            return
         shaped = display_text(value)
         if shaped != value:
-            self.text = shaped
+            self._updating_arabic_text = True
+            try:
+                self.text = shaped
+            finally:
+                self._updating_arabic_text = False
 
 
 class ArabicButton(Button):
