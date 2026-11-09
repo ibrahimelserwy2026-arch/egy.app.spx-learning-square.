@@ -281,6 +281,18 @@ def question_kind(talk: dict[str, Any]) -> str | None:
     return None
 
 
+
+def clean_qureo_text(value: Any) -> str:
+    """Remove QUREO's lightweight inline markers before displaying text."""
+    text = str(value or "")
+    for marker in (
+        "[[bdi]]", "[[/bdi]]", "[[code]]", "[[/code]]",
+        "[[copy]]", "[[/copy]]",
+    ):
+        text = text.replace(marker, "")
+    return text
+
+
 def render_lecture_payload(payload: dict[str, Any]) -> None:
     chapter = payload.get("chapter") or {}
     lecture = payload.get("lecture") or {}
@@ -294,16 +306,16 @@ def render_lecture_payload(payload: dict[str, Any]) -> None:
         f"عدد أسئلة الفصل المعلن: {chapter.get('question_count', '—')}"
     )
     if chapter.get("description"):
-        st.info(chapter["description"])
+        st.info(clean_qureo_text(chapter["description"]))
 
     for summary in payload.get("summaries") or []:
         if isinstance(summary, dict):
             summary_text = summary.get("text")
             check_text = summary.get("check_text")
             if summary_text:
-                st.markdown(f"**ملخص:** {summary_text}")
+                st.markdown(f"**ملخص:** {clean_qureo_text(summary_text)}")
             if check_text:
-                st.caption(check_text)
+                st.caption(clean_qureo_text(check_text))
 
     talks = payload.get("talks") or []
     question_number = 0
@@ -326,24 +338,24 @@ def render_lecture_payload(payload: dict[str, Any]) -> None:
             ):
                 if kind == "اختيار من متعدد":
                     if isinstance(question, str):
-                        st.markdown(question)
+                        st.markdown(clean_qureo_text(question))
                     else:
-                        st.markdown(str(question or "نص السؤال غير متاح."))
+                        st.markdown(clean_qureo_text(question or "نص السؤال غير متاح."))
                     choices = body.get("choices") or []
                     for choice in choices:
                         if not isinstance(choice, dict):
                             continue
                         label = choice.get("label", "")
                         value = choice.get("value", "")
-                        st.markdown(f"- **{label}** (value: {value})")
+                        st.markdown(f"- **{clean_qureo_text(label)}** (value: {value})")
                 else:
                     if isinstance(question, dict):
                         if question.get("no") is not None:
                             st.caption(f"رقم السؤال داخل الدرس: {question['no']}")
                         if question.get("text"):
-                            st.markdown(question["text"])
+                            st.markdown(clean_qureo_text(question["text"]))
                     elif question:
-                        st.markdown(str(question))
+                        st.markdown(clean_qureo_text(question))
 
                     if kind == "إكمال أجزاء الكود":
                         st.markdown("**الأجزاء المطلوب ملؤها:**")
@@ -368,21 +380,21 @@ def render_lecture_payload(payload: dict[str, Any]) -> None:
 
                         model_answer = code_item.get("model_answer")
                         if model_answer:
-                            with st.expander("عرض الإجابة النموذجية"):
-                                st.code(model_answer, language=code_item.get("lang") or "python")
+                            st.markdown("**الإجابة النموذجية:**")
+                            st.code(model_answer, language=code_item.get("lang") or "python")
 
                     hints = body.get("hints") or []
                     if hints:
-                        with st.expander("تلميحات السؤال"):
-                            for hint_index, hint in enumerate(hints, start=1):
-                                st.markdown(f"{hint_index}. {hint}")
+                        st.markdown("**تلميحات السؤال:**")
+                        for hint_index, hint in enumerate(hints, start=1):
+                            st.markdown(f"{hint_index}. {clean_qureo_text(hint)}")
 
                     guide = body.get("guide")
                     if guide:
-                        st.caption(f"الناتج/إرشاد المنصة: {guide}")
+                        st.caption(f"الناتج/إرشاد المنصة: {clean_qureo_text(guide)}")
         elif talk_type in ("teacher", "student") and body.get("serif"):
             speaker = "المعلم" if talk_type == "teacher" else "الطالب"
-            st.markdown(f"**{speaker}:** {body['serif']}")
+            st.markdown(f"**{speaker}:** {clean_qureo_text(body['serif'])}")
         elif talk_type == "supplement":
             title = body.get("title") or body.get("filename") or "مادة إضافية"
             st.caption(f"📎 مادة إضافية: {title}")
