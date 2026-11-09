@@ -13,7 +13,7 @@
 
 ## تشغيل برنامج Kivy المشابه لـ start_learn.py
 
-يتطلب Python 3.10 أو أحدث.
+يتطلب Python 3.10 أو أحدث. يعتمد دعم العربية على خط Tahoma الموجود عادةً في Windows، مع مكتبتَي `arabic-reshaper` و`python-bidi` المثبتتين من ملف المتطلبات. يكتشف البرنامج خط Tahoma تلقائيًا، ثم يجرب Arial وSegoe UI عند عدم توفره.
 
 على Windows:
 
