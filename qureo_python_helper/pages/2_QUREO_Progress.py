@@ -422,6 +422,7 @@ lecture_id_text = st.text_input(
     key="qureo_lecture_id_input",
 )
 if st.button("جلب محتوى الدرس وأسئلته", key="qureo_load_lecture", type="primary"):
+    st.session_state.pop("qureo_lecture_payload", None)
     cookie_header_for_lecture = normalize_cookie(raw_cookie)
     if not cookie_header_for_lecture:
         st.warning("الصقي Cookie الحالية في الشريط الجانبي أولًا.")
@@ -430,21 +431,24 @@ if st.button("جلب محتوى الدرس وأسئلته", key="qureo_load_lect
     else:
         try:
             lecture_id_value = int(lecture_id_text.strip())
-            if lecture_id_value <= 0:
-                raise ValueError
-            with st.spinner("جارٍ قراءة محتوى الدرس والأسئلة..."):
-                st.session_state["qureo_lecture_payload"] = load_lecture(
-                    lecture_id_value, cookie_header_for_lecture
-                )
-                st.session_state["qureo_loaded_lecture_id"] = lecture_id_value
-        except ValueError:
+        except (TypeError, ValueError):
             st.error("Lecture ID يجب أن يكون رقمًا صحيحًا موجبًا.")
-        except PermissionError as exc:
-            st.error(str(exc))
-        except requests.RequestException as exc:
-            st.error(f"تعذر الاتصال بـ QUREO. نوع الخطأ: {type(exc).__name__}")
-        except (ValueError, KeyError) as exc:
-            st.error(f"تعذر تحليل محتوى الدرس: {exc}")
+        else:
+            if lecture_id_value <= 0:
+                st.error("Lecture ID يجب أن يكون رقمًا صحيحًا موجبًا.")
+            else:
+                try:
+                    with st.spinner("جارٍ قراءة محتوى الدرس والأسئلة..."):
+                        st.session_state["qureo_lecture_payload"] = load_lecture(
+                            lecture_id_value, cookie_header_for_lecture
+                        )
+                        st.session_state["qureo_loaded_lecture_id"] = lecture_id_value
+                except PermissionError as exc:
+                    st.error(str(exc))
+                except requests.RequestException as exc:
+                    st.error(f"تعذر الاتصال بـ QUREO. نوع الخطأ: {type(exc).__name__}")
+                except (ValueError, KeyError) as exc:
+                    st.error(f"تعذر تحليل محتوى الدرس: {exc}")
 
 if st.session_state.get("qureo_lecture_payload"):
     render_lecture_payload(st.session_state["qureo_lecture_payload"])
