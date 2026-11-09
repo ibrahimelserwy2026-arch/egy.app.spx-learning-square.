@@ -226,6 +226,22 @@ def choice_feedback(choice: dict[str, Any]) -> list[str]:
     return feedback
 
 
+def choice_feedback_is_positive(choice: dict[str, Any]) -> bool:
+    text = " ".join(choice_feedback(choice)).lower()
+    positive = (
+        "correct", "that's right", "that is right", "great job",
+        "well done", "perfect", "excellent", "ممتاز", "صحيح",
+        "إجابة صحيحة", "اجابة صحيحة", "أحسنت", "احسنت", "رائع",
+    )
+    negative = (
+        "incorrect", "wrong", "try again", "not correct",
+        "خطأ", "غير صحيح", "إجابة خاطئة", "اجابة خاطئة",
+    )
+    return any(word in text for word in positive) and not any(
+        word in text for word in negative
+    )
+
+
 def suggest_choice(
     question_text: str,
     choices: list[dict[str, Any]],
@@ -504,8 +520,15 @@ def prepare_submission_questions(
                 ),
                 None,
             )
-            answer_value = str(correct.get("value", "")) if correct else ""
             source = "إجابة محددة صراحةً في بيانات السؤال"
+            if correct is None:
+                positive_matches = [
+                    item for item in choices if choice_feedback_is_positive(item)
+                ]
+                if len(positive_matches) == 1:
+                    correct = positive_matches[0]
+                    source = "تم تحديدها من after_talks الذي يعرض تغذية راجعة إيجابية"
+            answer_value = str(correct.get("value", "")) if correct else ""
             if not answer_value and api_key.strip():
                 try:
                     suggestion = suggest_choice(
@@ -518,8 +541,7 @@ def prepare_submission_questions(
                 except Exception:
                     pass
             if not answer_value:
-                answer_value = str(choices[0].get("value", ""))
-                source = "لا توجد علامة إجابة صحيحة؛ راجع الاختيار قبل الإرسال"
+                source = "لم تظهر إجابة صحيحة مؤكدة؛ اختر القيمة بنفسك قبل الإرسال"
             base.update({
                 "kind": "choice",
                 "lang": "",
@@ -756,6 +778,14 @@ class QureOHelperApp(App):
             size_hint_y=None,
             height=dp(28),
         ))
+        self.send_all_button = Button(
+            text="إرسال كل إجابات الدرس المجهزة",
+            size_hint_y=None,
+            height=dp(46),
+        )
+        self.send_all_button.bind(on_release=self.start_send_all)
+        root.add_widget(self.send_all_button)
+
         self.questions_scroll = ScrollView(size_hint_y=0.70)
         self.questions_layout = GridLayout(
             cols=1,
@@ -866,6 +896,10 @@ class QureOHelperApp(App):
 
     def _display_questions(self, questions: list[dict[str, Any]]):
         self.questions_layout.clear_widgets()
+        self.submission_entries: list[
+            tuple[dict[str, Any], list[tuple[str, TextInput]], Button]
+        ] = []
+        self.send_all_button.disabled = not bool(questions)
         if not questions:
             self.questions_layout.add_widget(Label(
                 text=(
@@ -973,6 +1007,104 @@ class QureOHelperApp(App):
             )
             card.add_widget(send_button)
             self.questions_layout.add_widget(card)
+            self.submission_entries.append((question, answer_fields, send_button))
+
+    @staticmethod
+    def _make_submission_body(
+        question: dict[str, Any],
+        answer_fields: list[tuple[str, TextInput]],
+    ) -> dict[str, Any]:
+        kind = question["kind"]
+        if kind == "choice":
+            value = answer_fields[0][1].text.strip()
+            if not value:
+                raise ValueError("قيمة الاختيار فارغة.")
+            body = {"choice_question": {"value": value}}
+        elif kind == "try_partial":
+            answers = [
+                {"name": name, "code": field.text}
+                for name, field in answer_fields
+            ]
+            if not answers or any(not item["code"].strip() for item in answers):
+                raise ValueError("يوجد جزء كود فارغ.")
+            body = {
+                "try_partial": {
+                    "lang": question["lang"],
+                    "answers": answers,
+                }
+            }
+        else:
+            answer = answer_fields[0][1].text
+            if not answer.strip():
+                raise ValueError("كود الإجابة فارغ.")
+            body = {
+                "try": {
+                    "lang": question["lang"],
+                    "answer": answer,
+                }
+            }
+        return {"value": body}
+
+    def start_send_all(self, _button):
+        try:
+            cookie = normalize_cookie(self.cookie_input.text)
+            if not cookie:
+                raise ValueError("أدخل Cookie الحالية أولًا.")
+            pending = []
+            skipped = []
+            for question, fields, send_button in self.submission_entries:
+                try:
+                    body = self._make_submission_body(question, fields)
+                    pending.append((question["talk_id"], body, send_button))
+                except ValueError as exc:
+                    skipped.append(f"Talk {question['talk_id']}: {exc}")
+            if not pending:
+                raise ValueError("لا توجد إجابات مكتملة للإرسال.")
+        except ValueError as exc:
+            self.status.text = str(exc)
+            return
+        self.send_all_button.disabled = True
+        for _talk_id, _body, send_button in pending:
+            send_button.disabled = True
+        self.status.text = f"جارٍ إرسال {len(pending)} إجابة..."
+        threading.Thread(
+            target=self._send_all_worker,
+            args=(cookie, pending, skipped),
+            daemon=True,
+        ).start()
+
+    def _send_all_worker(self, cookie, pending, skipped):
+        results = list(skipped)
+        succeeded = 0
+        for talk_id, body, _send_button in pending:
+            try:
+                status_code, result = put_json(
+                    f"/api/study/students/lecture-talks/{talk_id}",
+                    cookie,
+                    f"{BASE_URL}/",
+                    body,
+                )
+                succeeded += 1
+                results.append(
+                    f"Talk {talk_id}: HTTP {status_code} — "
+                    + json.dumps(result, ensure_ascii=False)[:1000]
+                )
+            except Exception as exc:
+                results.append(f"Talk {talk_id}: فشل — {self._friendly_error(exc)}")
+        message = (
+            f"نتيجة الإرسال الجماعي: نجح {succeeded} من {len(pending)}\n"
+            + "\n".join(results)
+        )
+        Clock.schedule_once(
+            lambda _dt: self._send_all_finished(pending, succeeded, message), 0
+        )
+
+    def _send_all_finished(self, pending, succeeded: int, message: str):
+        self.send_all_button.disabled = False
+        for _talk_id, _body, send_button in pending:
+            send_button.disabled = False
+        self.status.text = f"انتهى الإرسال: {succeeded} إجابة ناجحة"
+        self.output.text = (self.output.text + "\n\n" + message)[-12000:]
 
     def start_send_question(
         self,
@@ -984,36 +1116,7 @@ class QureOHelperApp(App):
             cookie = normalize_cookie(self.cookie_input.text)
             if not cookie:
                 raise ValueError("أدخل Cookie الحالية أولًا.")
-            kind = question["kind"]
-            if kind == "choice":
-                value = answer_fields[0][1].text.strip()
-                if not value:
-                    raise ValueError("اكتب قيمة الاختيار قبل الإرسال.")
-                body = {"choice_question": {"value": value}}
-            elif kind == "try_partial":
-                answers = [
-                    {"name": name, "code": field.text}
-                    for name, field in answer_fields
-                ]
-                if not answers or any(not item["code"].strip() for item in answers):
-                    raise ValueError("أكمل كل أجزاء الكود قبل الإرسال.")
-                body = {
-                    "try_partial": {
-                        "lang": question["lang"],
-                        "answers": answers,
-                    }
-                }
-            else:
-                answer = answer_fields[0][1].text
-                if not answer.strip():
-                    raise ValueError("اكتب كود الإجابة قبل الإرسال.")
-                body = {
-                    "try": {
-                        "lang": question["lang"],
-                        "answer": answer,
-                    }
-                }
-            request_body = {"value": body}
+            request_body = self._make_submission_body(question, answer_fields)
         except (KeyError, IndexError, ValueError) as exc:
             self.status.text = str(exc)
             return
