@@ -120,18 +120,7 @@ class ArabicTextInput(TextInput):
         kwargs["font_name"] = ARABIC_FONT_NAME
         if "hint_text" in kwargs:
             kwargs["hint_text"] = display_text(kwargs["hint_text"])
-        self._shape_readonly_text = bool(kwargs.get("readonly", False))
-        if self._shape_readonly_text and "text" in kwargs:
-            kwargs["text"] = display_text(kwargs["text"])
         super().__init__(**kwargs)
-        if self._shape_readonly_text:
-            self.bind(text=self._shape_updated_text)
-
-    def _shape_updated_text(self, _instance, value):
-        shaped = display_text(value)
-        if shaped != value:
-            self.text = shaped
-
 
 def normalize_cookie(raw: str) -> str:
     """Normalize a Cookie header pasted locally by the user."""
@@ -862,7 +851,7 @@ class QureOHelperApp(App):
         root.add_widget(self.status)
 
         self.output = ArabicTextInput(
-            text=(
+            text=display_text(
                 "اضغط «فحص التقدم وحل آخر درس» لقراءة آخر Chapter وLecture "
                 "وتجهيز إجابات الأسئلة."
             ),
@@ -1033,7 +1022,7 @@ class QureOHelperApp(App):
             card.add_widget(header)
 
             prompt = ArabicTextInput(
-                text=question.get("question_text") or "سؤال بدون نص",
+                text=display_text(question.get("question_text") or "سؤال بدون نص"),
                 readonly=True,
                 multiline=True,
                 size_hint_y=None,
@@ -1207,7 +1196,10 @@ class QureOHelperApp(App):
         for _talk_id, _body, send_button in pending:
             send_button.disabled = False
         self.status.text = f"انتهى الإرسال: {succeeded} إجابة ناجحة"
-        self.output.text = (self.output.text + "\n\n" + message)[-12000:]
+        self._raw_output = (
+            getattr(self, "_raw_output", "") + "\n\n" + message
+        )[-12000:]
+        self.output.text = display_text(self._raw_output)
 
     def start_send_question(
         self,
@@ -1264,7 +1256,10 @@ class QureOHelperApp(App):
         button.disabled = False
         self.send_all_button.disabled = not bool(self.submission_entries)
         self.status.text = status
-        self.output.text = (self.output.text + "\n\n" + message)[-12000:]
+        self._raw_output = (
+            getattr(self, "_raw_output", "") + "\n\n" + message
+        )[-12000:]
+        self.output.text = display_text(self._raw_output)
 
     @staticmethod
     def _friendly_error(exc: Exception) -> str:
@@ -1279,7 +1274,8 @@ class QureOHelperApp(App):
 
     def _finish(self, status: str, output: str):
         self.status.text = status
-        self.output.text = output
+        self._raw_output = output
+        self.output.text = display_text(output)
 
 
 if __name__ == "__main__":
