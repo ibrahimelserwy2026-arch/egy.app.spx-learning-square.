@@ -45,6 +45,33 @@ def parse_date(value: str | None) -> datetime:
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def load_lectures(chapter_id: int, cookie_header: str) -> list[dict[str, Any]]:
+    """Read the lecture list for one chapter; this endpoint is GET-only."""
+    url = f"{BASE_URL}/api/study/students/chapters/{chapter_id}/lectures"
+    headers = {
+        "Accept": "application/json",
+        "Cookie": cookie_header,
+        "Referer": f"{BASE_URL}/chapter/{chapter_id}",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    response = requests.get(url, headers=headers, timeout=20)
+    if response.status_code in (401, 403):
+        raise PermissionError(
+            "انتهت الجلسة أثناء قراءة الدروس. سجّلي الدخول مجددًا "
+            "وانسخي Cookie جديدة من المتصفح."
+        )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("استجابة المنصة ليست قائمة Lectures متوقعة.")
+    if any(not isinstance(item, dict) or "lecture_id" not in item for item in payload):
+        raise ValueError("بعض بيانات الدروس لا تحتوي على lecture_id.")
+    return payload
+
+
 def load_chapters(section_id: int, cookie_header: str) -> list[dict[str, Any]]:
     url = f"{BASE_URL}/api/study/students/sections/{section_id}/chapters"
     headers = {
@@ -156,6 +183,52 @@ if st.button("جلب الفصول وتحديد آخر فصل", type="primary", u
         st.info(
             f"الاستجابة الحالية تضم {len(chapters)} سجل فصل. "
             "إذا كان الكورس 25 فصلًا، فقد تكون هذه الواجهة أعادت الفصول التي لها سجل تقدم فقط."
+        )
+
+        st.subheader("دروس الفصل الحالي")
+        if current_id is not None:
+            with st.spinner("جارٍ قراءة قائمة الدروس للفصل الحالي..."):
+                lectures = load_lectures(int(current_id), cookie_header)
+
+            if lectures:
+                latest_incomplete = [
+                    (idx, lecture)
+                    for idx, lecture in enumerate(lectures, start=1)
+                    if not lecture.get("completed_at")
+                ]
+                lecture_rows = []
+                for idx, lecture in enumerate(lectures, start=1):
+                    is_active = (
+                        latest_incomplete
+                        and lecture.get("lecture_id") == max(
+                            latest_incomplete,
+                            key=lambda pair: parse_date(pair[1].get("started_at")),
+                        )[1].get("lecture_id")
+                    )
+                    lecture_rows.append({
+                        "الدرس": f"Lecture {idx}",
+                        "Lecture ID": lecture.get("lecture_id"),
+                        "الحالة": "مكتمل" if lecture.get("completed_at") else (
+                            "آخر درس بدأتِه" if is_active else "غير مكتمل"
+                        ),
+                        "بدأ في": lecture.get("started_at") or "—",
+                        "اكتمل في": lecture.get("completed_at") or "—",
+                    })
+                st.dataframe(lecture_rows, use_container_width=True, hide_index=True)
+
+                if latest_incomplete:
+                    active_lecture = max(
+                        latest_incomplete,
+                        key=lambda pair: parse_date(pair[1].get("started_at")),
+                    )[1]
+                    st.metric("Lecture ID التالي للمراجعة", str(active_lecture["lecture_id"]))
+                else:
+                    st.success("كل الدروس التي أعادتها المنصة مكتملة.")
+            else:
+                st.info("لم تُرجع المنصة أي دروس لهذا الفصل.")
+        st.caption(
+            "لم تتم إضافة خطوة الامتحان بعد؛ نحتاج إلى طلب بيانات الامتحان وطريقة عرضه "
+            "قبل بناء متابعة دقيقة له."
         )
 
     except PermissionError as exc:
