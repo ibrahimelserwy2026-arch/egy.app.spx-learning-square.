@@ -10,6 +10,7 @@ from typing import Any
 import requests
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.text import LabelBase
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -30,6 +31,106 @@ COOKIE_ATTRIBUTES = {
     "path", "domain", "expires", "max-age", "httponly",
     "secure", "samesite", "priority",
 }
+
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    ARABIC_SHAPING_AVAILABLE = True
+except ImportError:
+    arabic_reshaper = None
+    get_display = None
+    ARABIC_SHAPING_AVAILABLE = False
+
+
+def find_arabic_font() -> str:
+    """Find a Windows font with Arabic glyphs; Tahoma is preferred."""
+    windows_dir = os.environ.get("WINDIR", r"C:\Windows")
+    candidates = (
+        os.path.join(windows_dir, "Fonts", "tahoma.ttf"),
+        os.path.join(windows_dir, "Fonts", "arial.ttf"),
+        os.path.join(windows_dir, "Fonts", "segoeui.ttf"),
+    )
+    for font_path in candidates:
+        if os.path.isfile(font_path):
+            try:
+                LabelBase.register(name="QureoArabic", fn_regular=font_path)
+                return "QureoArabic"
+            except Exception:
+                continue
+    return "Roboto"
+
+
+ARABIC_FONT_NAME = find_arabic_font()
+
+
+def display_text(value: Any) -> str:
+    """Shape Arabic and apply RTL ordering one line at a time.
+
+    Lines without Arabic (for example Python code) are left untouched.
+    """
+    text = str(value or "")
+    if not ARABIC_SHAPING_AVAILABLE:
+        return text
+    output: list[str] = []
+    for line in text.splitlines(keepends=True):
+        ending = ""
+        content = line
+        if content.endswith("\r\n"):
+            content, ending = content[:-2], "\r\n"
+        elif content.endswith("\n") or content.endswith("\r"):
+            content, ending = content[:-1], content[-1]
+        if re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", content):
+            try:
+                content = get_display(arabic_reshaper.reshape(content), base_dir="R")
+            except Exception:
+                pass
+        output.append(content + ending)
+    return "".join(output)
+
+
+class ArabicLabel(Label):
+    def __init__(self, **kwargs):
+        kwargs["font_name"] = ARABIC_FONT_NAME
+        kwargs["text"] = display_text(kwargs.get("text", ""))
+        super().__init__(**kwargs)
+        self.bind(text=self._shape_updated_text)
+
+    def _shape_updated_text(self, _instance, value):
+        shaped = display_text(value)
+        if shaped != value:
+            self.text = shaped
+
+
+class ArabicButton(Button):
+    def __init__(self, **kwargs):
+        kwargs["font_name"] = ARABIC_FONT_NAME
+        kwargs["text"] = display_text(kwargs.get("text", ""))
+        super().__init__(**kwargs)
+        self.bind(text=self._shape_updated_text)
+
+    def _shape_updated_text(self, _instance, value):
+        shaped = display_text(value)
+        if shaped != value:
+            self.text = shaped
+
+
+class ArabicTextInput(TextInput):
+    def __init__(self, **kwargs):
+        kwargs["font_name"] = ARABIC_FONT_NAME
+        if "hint_text" in kwargs:
+            kwargs["hint_text"] = display_text(kwargs["hint_text"])
+        self._shape_readonly_text = bool(kwargs.get("readonly", False))
+        if self._shape_readonly_text and "text" in kwargs:
+            kwargs["text"] = display_text(kwargs["text"])
+        super().__init__(**kwargs)
+        if self._shape_readonly_text:
+            self.bind(text=self._shape_updated_text)
+
+    def _shape_updated_text(self, _instance, value):
+        shaped = display_text(value)
+        if shaped != value:
+            self.text = shaped
 
 
 def normalize_cookie(raw: str) -> str:
@@ -675,20 +776,20 @@ class QureOHelperApp(App):
             spacing=dp(8),
         )
 
-        root.add_widget(Label(
+        root.add_widget(ArabicLabel(
             text="QUREO Python Helper",
             font_size=sp(22),
             size_hint_y=None,
             height=dp(42),
         ))
-        root.add_widget(Label(
+        root.add_widget(ArabicLabel(
             text="الصق Cookie محليًا. لا ترسلها لأي شخص ولا تضعها في GitHub.",
             font_size=sp(13),
             size_hint_y=None,
             height=dp(30),
         ))
 
-        self.cookie_input = TextInput(
+        self.cookie_input = ArabicTextInput(
             hint_text="Cookie من طلب QUREO في Network",
             password=True,
             multiline=False,
@@ -698,7 +799,7 @@ class QureOHelperApp(App):
         )
         root.add_widget(self.cookie_input)
 
-        self.api_key_input = TextInput(
+        self.api_key_input = ArabicTextInput(
             text=os.getenv("OPENAI_API_KEY", ""),
             hint_text="OpenAI API Key (اختياري للأسئلة التي لا تحتوي model_answer)",
             password=True,
@@ -709,7 +810,7 @@ class QureOHelperApp(App):
         )
         root.add_widget(self.api_key_input)
 
-        self.model_input = TextInput(
+        self.model_input = ArabicTextInput(
             text=DEFAULT_MODEL,
             hint_text="OpenAI model",
             multiline=False,
@@ -719,7 +820,7 @@ class QureOHelperApp(App):
         )
         root.add_widget(self.model_input)
 
-        self.section_input = TextInput(
+        self.section_input = ArabicTextInput(
             text=SECTION_ID_DEFAULT,
             hint_text="Section ID",
             multiline=False,
@@ -735,11 +836,11 @@ class QureOHelperApp(App):
             size_hint_y=None,
             height=dp(48),
         )
-        scan_button = Button(text="فحص التقدم وحل آخر درس")
+        scan_button = ArabicButton(text="فحص التقدم وحل آخر درس")
         scan_button.bind(on_release=self.start_scan)
         actions.add_widget(scan_button)
 
-        self.lecture_input = TextInput(
+        self.lecture_input = ArabicTextInput(
             hint_text="Lecture ID اختياري",
             multiline=False,
             size_hint_x=0.55,
@@ -747,12 +848,12 @@ class QureOHelperApp(App):
         )
         actions.add_widget(self.lecture_input)
 
-        load_button = Button(text="حل هذا الدرس")
+        load_button = ArabicButton(text="حل هذا الدرس")
         load_button.bind(on_release=self.start_manual_load)
         actions.add_widget(load_button)
         root.add_widget(actions)
 
-        self.status = Label(
+        self.status = ArabicLabel(
             text="جاهز",
             size_hint_y=None,
             height=dp(30),
@@ -760,7 +861,7 @@ class QureOHelperApp(App):
         )
         root.add_widget(self.status)
 
-        self.output = TextInput(
+        self.output = ArabicTextInput(
             text=(
                 "اضغط «فحص التقدم وحل آخر درس» لقراءة آخر Chapter وLecture "
                 "وتجهيز إجابات الأسئلة."
@@ -772,13 +873,13 @@ class QureOHelperApp(App):
         )
         root.add_widget(self.output)
 
-        root.add_widget(Label(
+        root.add_widget(ArabicLabel(
             text="راجع كل إجابة ثم اضغط زر إرسال الخاص بالسؤال.",
             font_size=sp(12),
             size_hint_y=None,
             height=dp(28),
         ))
-        self.send_all_button = Button(
+        self.send_all_button = ArabicButton(
             text="إرسال كل إجابات الدرس المجهزة",
             size_hint_y=None,
             height=dp(46),
@@ -903,7 +1004,7 @@ class QureOHelperApp(App):
         ] = []
         self.send_all_button.disabled = not bool(questions)
         if not questions:
-            self.questions_layout.add_widget(Label(
+            self.questions_layout.add_widget(ArabicLabel(
                 text=(
                     "لم يتم تجهيز إجابات قابلة للإرسال. "
                     "قد لا يحتوي الدرس على model_answer أو placeholders."
@@ -921,7 +1022,7 @@ class QureOHelperApp(App):
                 size_hint_y=None,
             )
             card.bind(minimum_height=card.setter("height"))
-            header = Label(
+            header = ArabicLabel(
                 text=(
                     f"السؤال {number} | Talk ID: {question['talk_id']} "
                     f"| {question['kind']}"
@@ -931,7 +1032,7 @@ class QureOHelperApp(App):
             )
             card.add_widget(header)
 
-            prompt = TextInput(
+            prompt = ArabicTextInput(
                 text=question.get("question_text") or "سؤال بدون نص",
                 readonly=True,
                 multiline=True,
@@ -941,7 +1042,7 @@ class QureOHelperApp(App):
             )
             card.add_widget(prompt)
 
-            source = Label(
+            source = ArabicLabel(
                 text="مصدر الإجابة: " + question.get("answer_source", "غير محدد"),
                 size_hint_y=None,
                 height=dp(28),
@@ -952,12 +1053,12 @@ class QureOHelperApp(App):
             answer_fields: list[tuple[str, TextInput]] = []
             if question["kind"] == "try_partial":
                 for part in question.get("answers") or []:
-                    card.add_widget(Label(
+                    card.add_widget(ArabicLabel(
                         text=f"الجزء: {part['name']}",
                         size_hint_y=None,
                         height=dp(24),
                     ))
-                    field = TextInput(
+                    field = ArabicTextInput(
                         text=part["code"],
                         multiline=True,
                         size_hint_y=None,
@@ -971,13 +1072,13 @@ class QureOHelperApp(App):
                     f"{item['label']}  [value={item['value']}]"
                     for item in question.get("choices") or []
                 )
-                card.add_widget(Label(
+                card.add_widget(ArabicLabel(
                     text=options_text,
                     size_hint_y=None,
                     height=dp(max(35, min(100, 22 * len(question.get("choices") or [])))),
                     font_size=sp(11),
                 ))
-                field = TextInput(
+                field = ArabicTextInput(
                     text=str(question.get("answer") or ""),
                     hint_text="قيمة الاختيار value",
                     multiline=False,
@@ -988,7 +1089,7 @@ class QureOHelperApp(App):
                 answer_fields.append(("value", field))
                 card.add_widget(field)
             else:
-                field = TextInput(
+                field = ArabicTextInput(
                     text=str(question.get("answer") or ""),
                     multiline=True,
                     size_hint_y=None,
@@ -998,7 +1099,7 @@ class QureOHelperApp(App):
                 answer_fields.append(("answer", field))
                 card.add_widget(field)
 
-            send_button = Button(
+            send_button = ArabicButton(
                 text="إرسال إجابة هذا السؤال إلى QUREO",
                 size_hint_y=None,
                 height=dp(44),
