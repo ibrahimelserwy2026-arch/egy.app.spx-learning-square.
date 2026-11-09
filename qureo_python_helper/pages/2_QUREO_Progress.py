@@ -14,9 +14,9 @@ COOKIE_ATTRIBUTES = {
 
 
 def normalize_cookie(raw: str) -> str:
-    """Accept a Cookie header or copied Set-Cookie lines; never log values."""
+    """Convert a copied Cookie header or Set-Cookie lines to a Cookie header."""
     parts: dict[str, str] = {}
-    cleaned = raw.replace("\\r", "").replace("\\n", ";")
+    cleaned = raw.replace("\r", "").replace("\n", ";")
     for item in cleaned.split(";"):
         item = item.strip()
         if not item:
@@ -39,9 +39,10 @@ def parse_date(value: str | None) -> datetime:
     if not value:
         return datetime.min.replace(tzinfo=timezone.utc)
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))\n        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
-        return datetime.min
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def load_chapters(section_id: int, cookie_header: str) -> list[dict[str, Any]]:
@@ -50,7 +51,10 @@ def load_chapters(section_id: int, cookie_header: str) -> list[dict[str, Any]]:
         "Accept": "application/json",
         "Cookie": cookie_header,
         "Referer": f"{BASE_URL}/section/{section_id}",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        ),
     }
     response = requests.get(url, headers=headers, timeout=20)
     if response.status_code in (401, 403):
@@ -125,7 +129,7 @@ if st.button("جلب الفصول وتحديد آخر فصل", type="primary", u
             current_id = current_chapter["chapter_id"]
             st.success(f"آخر فصل غير مكتمل بدأتيه: Chapter {current_number}")
             col1, col2 = st.columns(2)
-            col1.metric("رقم الفصل", f"Chapter {current_number}")
+            col1.metric("رقم الفصل داخل الاستجابة", f"Chapter {current_number}")
             col2.metric("Chapter ID", str(current_id))
             st.code(str(current_id), language="text")
         else:
@@ -136,25 +140,23 @@ if st.button("جلب الفصول وتحديد آخر فصل", type="primary", u
             complete = bool(chapter.get("completed_at"))
             is_current = chapter.get("chapter_id") == current_id
             rows.append({
-                "الفصل": f"Chapter {idx}",
+                "ترتيب السجل": idx,
                 "Chapter ID": chapter.get("chapter_id"),
-                "الحالة": "مكتمل" if complete else ("آخر فصل بدأتِه" if is_current else "غير مكتمل"),
+                "الحالة": "مكتمل" if complete else (
+                    "آخر فصل بدأتِه" if is_current else "غير مكتمل"
+                ),
                 "بدأ في": chapter.get("started_at") or "—",
                 "اكتمل في": chapter.get("completed_at") or "—",
                 "أفضل إجابات صحيحة": chapter.get("best_correct_count", 0),
                 "Diamonds": chapter.get("diamond", 0),
             })
 
-        st.subheader("سجل الفصول")
+        st.subheader("سجل الفصول الذي أعادته المنصة")
         st.dataframe(rows, use_container_width=True, hide_index=True)
-
-        options = {
-            f"Chapter {idx} — ID {chapter['chapter_id']}": chapter["chapter_id"]
-            for idx, chapter in enumerate(chapters, start=1)
-        }
-        st.subheader("اختيار Chapter")
-        selected = st.selectbox("اختاري فصلًا", list(options))
-        st.text_input("Chapter ID المحدد", value=str(options[selected]))
+        st.info(
+            f"الاستجابة الحالية تضم {len(chapters)} سجل فصل. "
+            "إذا كان الكورس 25 فصلًا، فقد تكون هذه الواجهة أعادت الفصول التي لها سجل تقدم فقط."
+        )
 
     except PermissionError as exc:
         st.error(str(exc))
