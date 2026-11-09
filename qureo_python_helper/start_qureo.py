@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -16,9 +19,10 @@ from kivy.uix.textinput import TextInput
 
 BASE_URL = "https://me-tp.qureo.education"
 SECTION_ID_DEFAULT = "106"
+DEFAULT_MODEL = "gpt-4.1-mini"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 Chrome/157.0.0.0 Safari/537.36"
 )
 COOKIE_ATTRIBUTES = {
     "path", "domain", "expires", "max-age", "httponly",
@@ -58,7 +62,7 @@ def parse_date(value: str | None) -> datetime:
 
 
 def get_json(path: str, cookie_header: str, referer: str) -> Any:
-    """Make a read-only GET request. No answer or completion requests exist here."""
+    """Read QUREO data with GET only. No answer or completion calls are made."""
     headers = {
         "Accept": "application/json",
         "Cookie": cookie_header,
@@ -126,6 +130,51 @@ def clean_text(value: Any) -> str:
     return text.strip()
 
 
+def openai_text(api_key: str, model: str, prompt: str) -> str:
+    """Call OpenAI with the question only; QUREO cookies are never sent."""
+    if not api_key.strip():
+        raise ValueError("أدخل مفتاح OpenAI API لتوليد اقتراح لهذا السؤال.")
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": "Bearer " + api_key.strip(),
+            "Content-Type": "application/json",
+        },
+        json={"model": model.strip() or DEFAULT_MODEL, "input": prompt},
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    pieces: list[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                pieces.append(str(part.get("text") or ""))
+    result = "\n".join(pieces).strip()
+    if not result:
+        raise ValueError("لم يرجع النموذج نص إجابة قابلًا للقراءة.")
+    return result
+
+
+def parse_json_object(text: str) -> dict[str, Any] | None:
+    fence = chr(96) * 3
+    cleaned = text.strip().replace(fence + "json", "").replace(fence, "").strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = json.loads(cleaned[start:end + 1])
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 def choice_feedback(choice: dict[str, Any]) -> list[str]:
     feedback: list[str] = []
     for item in choice.get("after_talks") or []:
@@ -138,30 +187,103 @@ def choice_feedback(choice: dict[str, Any]) -> list[str]:
     return feedback
 
 
-def infer_choice_from_feedback(choices: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Suggest a choice only when the lesson payload explicitly includes clear feedback."""
-    positive_markers = (
-        "صحيح", "ممتاز", "أحسنت", "إجابة صحيحة", "correct", "great job",
+def suggest_choice(
+    question_text: str,
+    choices: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+) -> str:
+    options = [
+        {
+            "label": clean_text(choice.get("label")),
+            "value": str(choice.get("value", "")),
+        }
+        for choice in choices
+        if isinstance(choice, dict)
+    ]
+    prompt = (
+        "أنت مساعد تعليمي لأسئلة Python. حل السؤال حسب منطق الكود، "
+        "واختر قيمة واحدة من الخيارات المعطاة فقط. لا تعتمد على تخمين "
+        "مفتاح إجابة مخفي. أعد JSON فقط بهذا الشكل: "
+        '{"value":"القيمة","reason":"سبب مختصر بالعربية"}.\n'
+        "السؤال:\n" + clean_text(question_text) +
+        "\nالاختيارات:\n" + json.dumps(options, ensure_ascii=False)
     )
-    negative_markers = (
-        "حظا أوفر", "حظًا أوفر", "خطأ", "غير صحيح", "wrong", "try again",
+    raw = openai_text(api_key, model, prompt)
+    parsed = parse_json_object(raw)
+    allowed_values = {item["value"] for item in options}
+    if not parsed or str(parsed.get("value", "")) not in allowed_values:
+        return "لم أستطع التحقق من قيمة الاختيار المقترحة:\n" + raw
+
+    value = str(parsed["value"])
+    label = next(
+        (item["label"] for item in options if item["value"] == value),
+        value,
     )
-    positives: list[dict[str, Any]] = []
-    for choice in choices:
-        feedback = " ".join(choice_feedback(choice)).lower()
-        is_positive = any(marker in feedback for marker in positive_markers)
-        is_negative = any(marker in feedback for marker in negative_markers)
-        if is_positive and not is_negative:
-            positives.append(choice)
-    return positives[0] if len(positives) == 1 else None
+    return (
+        f"الاختيار المقترح: {label} [value={value}]\n"
+        f"السبب: {parsed.get('reason', '')}"
+    )
+
+
+def compile_partial_code(code_item: dict[str, Any]) -> str:
+    """Fill fitbBlock lines from the per-placeholder model answers."""
+    code = str(code_item.get("code") or "")
+    for placeholder in code_item.get("placeholders") or []:
+        if not isinstance(placeholder, dict):
+            continue
+        name = str(placeholder.get("name") or "")
+        answer = (
+            placeholder.get("model_answer")
+            or placeholder.get("alternative_code")
+            or placeholder.get("default_code")
+        )
+        if not name or answer is None:
+            continue
+        pattern = r"(?m)^([ \t]*)" + re.escape(name) + r"[ \t]*$"
+        code = re.sub(
+            pattern,
+            lambda match, replacement=str(answer): match.group(1) + replacement,
+            code,
+        )
+    return code
+
+
+def suggest_code(
+    question_text: str,
+    code_item: dict[str, Any],
+    hints: list[Any],
+    api_key: str,
+    model: str,
+) -> tuple[str, str]:
+    model_answer = code_item.get("model_answer")
+    if model_answer:
+        return str(model_answer), "الإجابة النموذجية المرفقة في بيانات QUREO."
+
+    if code_item.get("placeholders"):
+        completed = compile_partial_code(code_item)
+        if completed.strip():
+            return completed, "تم ملء الأجزاء من إجابات placeholders الموجودة في الدرس."
+
+    prompt = (
+        'حل تمرين Python التالي، وأعد JSON فقط: '
+        '{"code":"كود Python كامل","explanation":"شرح عربي مختصر"}.\n'
+        "نص السؤال:\n" + clean_text(question_text) +
+        "\nالكود الابتدائي:\n" + str(code_item.get("code") or "") +
+        "\nالتلميحات:\n" + "\n".join(clean_text(hint) for hint in hints)
+    )
+    parsed = parse_json_object(openai_text(api_key, model, prompt))
+    if not parsed or not isinstance(parsed.get("code"), str):
+        raise ValueError("لم أتمكن من تحليل كود الإجابة المقترح.")
+    return parsed["code"], str(parsed.get("explanation") or "")
 
 
 def question_kind(talk: dict[str, Any]) -> str | None:
-    kind = talk.get("type")
+    talk_type = talk.get("type")
     body = talk.get("body") or {}
-    if kind == "choice_question":
+    if talk_type == "choice_question":
         return "اختيار من متعدد"
-    if kind == "try":
+    if talk_type == "try":
         codes = body.get("codes") or []
         has_parts = body.get("editor_type") == "part" or any(
             isinstance(item, dict) and item.get("placeholders")
@@ -171,7 +293,11 @@ def question_kind(talk: dict[str, Any]) -> str | None:
     return None
 
 
-def format_lecture(payload: dict[str, Any]) -> str:
+def format_lecture(
+    payload: dict[str, Any],
+    api_key: str,
+    model: str,
+) -> str:
     chapter = payload.get("chapter") or {}
     lecture = payload.get("lecture") or {}
     lines = [
@@ -203,18 +329,20 @@ def format_lecture(payload: dict[str, Any]) -> str:
 
         if kind:
             question_number += 1
+            question = body.get("question")
+            if isinstance(question, dict):
+                question_text = question.get("text") or ""
+                question_no = question.get("no")
+            else:
+                question_text = str(question or "")
+                question_no = None
+
             lines.extend([
                 "-" * 66,
                 f"السؤال {question_number} | النوع: {kind} | Talk ID: {talk_id}",
             ])
-            question = body.get("question")
-
-            if isinstance(question, dict):
-                if question.get("no") is not None:
-                    lines.append(f"رقم السؤال داخل الدرس: {question['no']}")
-                question_text = question.get("text")
-            else:
-                question_text = question
+            if question_no is not None:
+                lines.append(f"رقم السؤال داخل الدرس: {question_no}")
             if question_text:
                 lines.append(clean_text(question_text))
             lines.append("")
@@ -228,19 +356,16 @@ def format_lecture(payload: dict[str, Any]) -> str:
                     label = clean_text(choice.get("label", ""))
                     value = choice.get("value", "")
                     lines.append(f"  • {label}  [value={value}]")
-                    for feedback in choice_feedback(choice):
-                        lines.append("      رد المنصة: " + feedback)
-                suggested = infer_choice_from_feedback(choices)
-                if suggested:
+                try:
                     lines.append(
-                        "اقتراح ظاهر من رد المنصة: "
-                        f"{clean_text(suggested.get('label', ''))} "
-                        f"[value={suggested.get('value', '')}]"
+                        suggest_choice(question_text, choices, api_key, model)
                     )
-                else:
-                    lines.append("لم يظهر رد واضح يسمح باقتراح اختيار تلقائي.")
+                except Exception as exc:
+                    lines.append("لم يتم توليد اقتراح اختيار: " + str(exc))
             else:
-                for code_item in body.get("codes") or []:
+                hints = body.get("hints") or []
+                codes = body.get("codes") or []
+                for code_item in codes:
                     if not isinstance(code_item, dict):
                         continue
                     language = code_item.get("lang") or "python"
@@ -252,24 +377,27 @@ def format_lecture(payload: dict[str, Any]) -> str:
                     placeholders = code_item.get("placeholders") or []
                     if placeholders:
                         lines.append("الأجزاء المطلوبة:")
-                        for placeholder in placeholders:
-                            if not isinstance(placeholder, dict):
+                        for part in placeholders:
+                            if not isinstance(part, dict):
                                 continue
-                            position = placeholder.get("position") or {}
+                            position = part.get("position") or {}
                             lines.append(
-                                f"  {placeholder.get('name', 'جزء')} "
+                                f"  {part.get('name', 'جزء')} "
                                 f"(السطر {position.get('line', '?')}): "
-                                f"{placeholder.get('model_answer', '')}"
+                                f"{part.get('model_answer', '')}"
                             )
 
-                    model_answer = code_item.get("model_answer")
-                    if model_answer:
-                        lines.append(f"الإجابة النموذجية ({language}):")
-                        lines.append(str(model_answer))
-                    else:
-                        lines.append("لا توجد إجابة نموذجية في استجابة هذا السؤال.")
+                    try:
+                        answer, explanation = suggest_code(
+                            question_text, code_item, hints, api_key, model
+                        )
+                        lines.append(f"الحل المقترح ({language}):")
+                        lines.append(answer)
+                        if explanation:
+                            lines.append("الشرح: " + explanation)
+                    except Exception as exc:
+                        lines.append("لم يتم تجهيز كود لهذا السؤال: " + str(exc))
 
-                hints = body.get("hints") or []
                 if hints:
                     lines.append("التلميحات:")
                     for index, hint in enumerate(hints, start=1):
@@ -292,7 +420,8 @@ def format_lecture(payload: dict[str, Any]) -> str:
         "",
         "=" * 66,
         f"عدد الأسئلة المكتشفة: {question_number}",
-        "تم جلب المحتوى وتجهيز الحلول محليًا. لم يتم إرسال إجابات أو إكمال الدرس.",
+        "تم تجهيز الحلول المقترحة محليًا. لم يتم إرسال إجابات إلى QUREO "
+        "ولم يتم استدعاء endpoint إكمال الدرس أو الاختبار.",
         "=" * 66,
     ])
     return "\n".join(lines)
@@ -359,9 +488,8 @@ class QureOHelperApp(App):
             size_hint_y=None,
             height=dp(42),
         ))
-
         root.add_widget(Label(
-            text="الصق Cookie محليًا؛ لا ترسلها لأي شخص ولا تحفظها في GitHub.",
+            text="الصق Cookie محليًا. لا ترسلها لأي شخص ولا تضعها في GitHub.",
             font_size=sp(13),
             size_hint_y=None,
             height=dp(30),
@@ -372,17 +500,38 @@ class QureOHelperApp(App):
             password=True,
             multiline=False,
             size_hint_y=None,
-            height=dp(48),
+            height=dp(46),
             font_size=sp(13),
         )
         root.add_widget(self.cookie_input)
+
+        self.api_key_input = TextInput(
+            text=os.getenv("OPENAI_API_KEY", ""),
+            hint_text="OpenAI API Key (اختياري للأسئلة التي لا تحتوي model_answer)",
+            password=True,
+            multiline=False,
+            size_hint_y=None,
+            height=dp(46),
+            font_size=sp(13),
+        )
+        root.add_widget(self.api_key_input)
+
+        self.model_input = TextInput(
+            text=DEFAULT_MODEL,
+            hint_text="OpenAI model",
+            multiline=False,
+            size_hint_y=None,
+            height=dp(40),
+            font_size=sp(13),
+        )
+        root.add_widget(self.model_input)
 
         self.section_input = TextInput(
             text=SECTION_ID_DEFAULT,
             hint_text="Section ID",
             multiline=False,
             size_hint_y=None,
-            height=dp(42),
+            height=dp(40),
             font_size=sp(15),
         )
         root.add_widget(self.section_input)
@@ -393,7 +542,7 @@ class QureOHelperApp(App):
             size_hint_y=None,
             height=dp(48),
         )
-        scan_button = Button(text="فحص التقدم وجلب آخر درس")
+        scan_button = Button(text="فحص التقدم وحل آخر درس")
         scan_button.bind(on_release=self.start_scan)
         actions.add_widget(scan_button)
 
@@ -405,7 +554,7 @@ class QureOHelperApp(App):
         )
         actions.add_widget(self.lecture_input)
 
-        load_button = Button(text="جلب هذا الدرس")
+        load_button = Button(text="حل هذا الدرس")
         load_button.bind(on_release=self.start_manual_load)
         actions.add_widget(load_button)
         root.add_widget(actions)
@@ -420,8 +569,8 @@ class QureOHelperApp(App):
 
         self.output = TextInput(
             text=(
-                "اضغط «فحص التقدم وجلب آخر درس» لقراءة آخر Chapter وLecture "
-                "وعرض الأسئلة والحلول النموذجية المتاحة."
+                "اضغط «فحص التقدم وحل آخر درس» لقراءة آخر Chapter وLecture "
+                "واستخراج الإجابات النموذجية أو اقتراح حلول للأسئلة."
             ),
             multiline=True,
             readonly=True,
@@ -429,9 +578,19 @@ class QureOHelperApp(App):
             font_size=sp(13),
         )
         root.add_widget(self.output)
+
+        root.add_widget(Label(
+            text=(
+                "مساعد الحل لا يرسل إجابات أو ينهي الدرس/الاختبار. "
+                "راجع الاقتراحات وأدخل إجاباتك بنفسك على المنصة."
+            ),
+            font_size=sp(12),
+            size_hint_y=None,
+            height=dp(38),
+        ))
         return root
 
-    def _get_cookie_and_section(self) -> tuple[str, int]:
+    def _get_inputs(self) -> tuple[str, int, str, str]:
         cookie = normalize_cookie(self.cookie_input.text)
         if not cookie:
             raise ValueError("أدخل Cookie الحالية أولًا.")
@@ -441,22 +600,26 @@ class QureOHelperApp(App):
             raise ValueError("Section ID يجب أن يكون رقمًا صحيحًا.") from exc
         if section_id <= 0:
             raise ValueError("Section ID يجب أن يكون أكبر من صفر.")
-        return cookie, section_id
+        api_key = self.api_key_input.text.strip()
+        model = self.model_input.text.strip() or DEFAULT_MODEL
+        return cookie, section_id, api_key, model
 
     def start_scan(self, _button):
         try:
-            cookie, section_id = self._get_cookie_and_section()
+            cookie, section_id, api_key, model = self._get_inputs()
         except ValueError as exc:
             self.status.text = str(exc)
             return
-        self.status.text = "جارٍ قراءة التقدم وتحميل آخر درس..."
+        self.status.text = "جارٍ قراءة التقدم وتحليل الأسئلة..."
         threading.Thread(
             target=self._scan_worker,
-            args=(cookie, section_id),
+            args=(cookie, section_id, api_key, model),
             daemon=True,
         ).start()
 
-    def _scan_worker(self, cookie: str, section_id: int):
+    def _scan_worker(
+        self, cookie: str, section_id: int, api_key: str, model: str
+    ):
         try:
             report, lecture_id = scan_latest(cookie, section_id)
             if lecture_id is None:
@@ -465,9 +628,9 @@ class QureOHelperApp(App):
                 )
                 return
             payload = load_lecture(lecture_id, cookie)
-            output = report + "\n\n" + format_lecture(payload)
+            output = report + "\n\n" + format_lecture(payload, api_key, model)
             Clock.schedule_once(
-                lambda _dt: self._finish("تم تحميل الدرس وتجهيز الحلول", output), 0
+                lambda _dt: self._finish("تم تحليل الدرس وتجهيز الحلول", output), 0
             )
         except Exception as exc:
             message = self._friendly_error(exc)
@@ -477,26 +640,28 @@ class QureOHelperApp(App):
 
     def start_manual_load(self, _button):
         try:
-            cookie, _section_id = self._get_cookie_and_section()
+            cookie, _section_id, api_key, model = self._get_inputs()
             lecture_id = int(self.lecture_input.text.strip())
             if lecture_id <= 0:
                 raise ValueError
         except ValueError:
             self.status.text = "أدخل Cookie وLecture ID صحيحًا."
             return
-        self.status.text = f"جارٍ تحميل Lecture {lecture_id}..."
+        self.status.text = f"جارٍ تحليل Lecture {lecture_id}..."
         threading.Thread(
             target=self._manual_worker,
-            args=(cookie, lecture_id),
+            args=(cookie, lecture_id, api_key, model),
             daemon=True,
         ).start()
 
-    def _manual_worker(self, cookie: str, lecture_id: int):
+    def _manual_worker(
+        self, cookie: str, lecture_id: int, api_key: str, model: str
+    ):
         try:
             payload = load_lecture(lecture_id, cookie)
-            output = format_lecture(payload)
+            output = format_lecture(payload, api_key, model)
             Clock.schedule_once(
-                lambda _dt: self._finish("تم تحميل الدرس", output), 0
+                lambda _dt: self._finish("تم تحميل الدرس وتجهيز الحلول", output), 0
             )
         except Exception as exc:
             message = self._friendly_error(exc)
@@ -510,8 +675,8 @@ class QureOHelperApp(App):
             return str(exc)
         if isinstance(exc, requests.RequestException):
             return (
-                f"فشل الاتصال بـ QUREO ({type(exc).__name__}). "
-                "تحقق من الإنترنت وصلاحية Cookie."
+                f"فشل الاتصال ({type(exc).__name__}). "
+                "تحقق من الإنترنت وصلاحية Cookie أو مفتاح OpenAI."
             )
         return f"{type(exc).__name__}: {exc}"
 
