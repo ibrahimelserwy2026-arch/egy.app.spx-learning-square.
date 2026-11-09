@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -37,9 +37,9 @@ def normalize_cookie(raw: str) -> str:
 
 def parse_date(value: str | None) -> datetime:
     if not value:
-        return datetime.min
+        return datetime.min.replace(tzinfo=timezone.utc)
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))\n        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return datetime.min
 
