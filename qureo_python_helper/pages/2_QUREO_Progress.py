@@ -237,3 +237,202 @@ if st.button("جلب الفصول وتحديد آخر فصل", type="primary", u
         st.error(f"تعذر الاتصال بالمنصة. نوع الخطأ: {type(exc).__name__}")
     except (ValueError, KeyError) as exc:
         st.error(f"تعذر تحليل استجابة الفصول: {exc}")
+
+
+def load_lecture(lecture_id: int, cookie_header: str) -> dict[str, Any]:
+    """Read one lecture's content and talk/question definitions (GET only)."""
+    url = f"{BASE_URL}/api/study/lectures/{lecture_id}"
+    headers = {
+        "Accept": "application/json",
+        "Cookie": cookie_header,
+        "Referer": f"{BASE_URL}/chapter/{lecture_id // 1000}/lecture/{lecture_id}",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    response = requests.get(url, headers=headers, timeout=20)
+    if response.status_code in (401, 403):
+        raise PermissionError(
+            "انتهت الجلسة أو Cookie غير صالحة. سجّلي الدخول إلى QUREO "
+            "وانسخي Cookie جديدة من المتصفح."
+        )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("talks"), list):
+        raise ValueError("استجابة محتوى الدرس لا تحتوي على talks بالشكل المتوقع.")
+    return payload
+
+
+def question_kind(talk: dict[str, Any]) -> str | None:
+    """Map QUREO talk payloads to the three exercise formats."""
+    talk_type = talk.get("type")
+    body = talk.get("body") or {}
+    if talk_type == "choice_question":
+        return "اختيار من متعدد"
+    if talk_type == "try":
+        codes = body.get("codes") or []
+        if body.get("editor_type") == "part" or any(
+            isinstance(item, dict) and item.get("placeholders")
+            for item in codes
+        ):
+            return "إكمال أجزاء الكود"
+        return "كتابة كود"
+    return None
+
+
+def render_lecture_payload(payload: dict[str, Any]) -> None:
+    chapter = payload.get("chapter") or {}
+    lecture = payload.get("lecture") or {}
+    st.subheader(
+        f"📖 {lecture.get('title') or 'محتوى الدرس'} "
+        f"(Lecture ID: {lecture.get('id', '—')})"
+    )
+    st.caption(
+        f"Chapter {chapter.get('seq', '—')} · "
+        f"{chapter.get('name', '—')} · "
+        f"عدد أسئلة الفصل المعلن: {chapter.get('question_count', '—')}"
+    )
+    if chapter.get("description"):
+        st.info(chapter["description"])
+
+    for summary in payload.get("summaries") or []:
+        if isinstance(summary, dict):
+            summary_text = summary.get("text")
+            check_text = summary.get("check_text")
+            if summary_text:
+                st.markdown(f"**ملخص:** {summary_text}")
+            if check_text:
+                st.caption(check_text)
+
+    talks = payload.get("talks") or []
+    question_number = 0
+    st.markdown("#### محتوى الدرس والأسئلة")
+
+    for talk in talks:
+        if not isinstance(talk, dict):
+            continue
+        talk_id = talk.get("id", "—")
+        talk_type = talk.get("type", "unknown")
+        body = talk.get("body") or {}
+        kind = question_kind(talk)
+
+        if kind:
+            question_number += 1
+            question = body.get("question")
+            with st.expander(
+                f"السؤال {question_number} · {kind} · Talk ID: {talk_id}",
+                expanded=True,
+            ):
+                if kind == "اختيار من متعدد":
+                    if isinstance(question, str):
+                        st.markdown(question)
+                    else:
+                        st.markdown(str(question or "نص السؤال غير متاح."))
+                    choices = body.get("choices") or []
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        label = choice.get("label", "")
+                        value = choice.get("value", "")
+                        st.markdown(f"- **{label}** (value: {value})")
+                else:
+                    if isinstance(question, dict):
+                        if question.get("no") is not None:
+                            st.caption(f"رقم السؤال داخل الدرس: {question['no']}")
+                        if question.get("text"):
+                            st.markdown(question["text"])
+                    elif question:
+                        st.markdown(str(question))
+
+                    if kind == "إكمال أجزاء الكود":
+                        st.markdown("**الأجزاء المطلوب ملؤها:**")
+                    for code_item in body.get("codes") or []:
+                        if not isinstance(code_item, dict):
+                            continue
+                        starter = code_item.get("code")
+                        if starter:
+                            st.markdown("**الكود المعروض في المحرر:**")
+                            st.code(starter, language=code_item.get("lang") or "python")
+
+                        placeholders = code_item.get("placeholders") or []
+                        for placeholder in placeholders:
+                            if not isinstance(placeholder, dict):
+                                continue
+                            position = placeholder.get("position") or {}
+                            st.markdown(
+                                f"- **{placeholder.get('name', 'جزء')}** "
+                                f"(السطر {position.get('line', '?')}): "
+                                f"{placeholder.get('model_answer', '')}"
+                            )
+
+                        model_answer = code_item.get("model_answer")
+                        if model_answer:
+                            with st.expander("عرض الإجابة النموذجية"):
+                                st.code(model_answer, language=code_item.get("lang") or "python")
+
+                    hints = body.get("hints") or []
+                    if hints:
+                        with st.expander("تلميحات السؤال"):
+                            for hint_index, hint in enumerate(hints, start=1):
+                                st.markdown(f"{hint_index}. {hint}")
+
+                    guide = body.get("guide")
+                    if guide:
+                        st.caption(f"الناتج/إرشاد المنصة: {guide}")
+        elif talk_type in ("teacher", "student") and body.get("serif"):
+            speaker = "المعلم" if talk_type == "teacher" else "الطالب"
+            st.markdown(f"**{speaker}:** {body['serif']}")
+        elif talk_type == "supplement":
+            title = body.get("title") or body.get("filename") or "مادة إضافية"
+            st.caption(f"📎 مادة إضافية: {title}")
+        else:
+            with st.expander(f"عنصر إضافي · {talk_type} · ID: {talk_id}"):
+                st.json(body)
+
+    st.divider()
+    st.caption(
+        f"تم تحليل {question_number} سؤالًا ظاهرًا في هذا الدرس. "
+        "المحتوى المعروض للقراءة والمراجعة فقط؛ لم يتم إرسال إجابات أو إكمال الدرس."
+    )
+
+
+st.divider()
+st.subheader("🧩 قراءة أسئلة ومحتوى درس محدد")
+st.write(
+    "أدخلي Lecture ID لعرض نص الدرس والأسئلة ومعرّف كل سؤال. "
+    "تُقرأ البيانات من QUREO بطلب GET فقط."
+)
+lecture_id_text = st.text_input(
+    "Lecture ID",
+    value="",
+    placeholder="مثال: 511008010",
+    key="qureo_lecture_id_input",
+)
+if st.button("جلب محتوى الدرس وأسئلته", key="qureo_load_lecture", type="primary"):
+    cookie_header_for_lecture = normalize_cookie(raw_cookie)
+    if not cookie_header_for_lecture:
+        st.warning("الصقي Cookie الحالية في الشريط الجانبي أولًا.")
+    elif "egy_student_access_token=" not in cookie_header_for_lecture:
+        st.warning("لم يتم العثور على egy_student_access_token في Cookie.")
+    else:
+        try:
+            lecture_id_value = int(lecture_id_text.strip())
+            if lecture_id_value <= 0:
+                raise ValueError
+            with st.spinner("جارٍ قراءة محتوى الدرس والأسئلة..."):
+                st.session_state["qureo_lecture_payload"] = load_lecture(
+                    lecture_id_value, cookie_header_for_lecture
+                )
+                st.session_state["qureo_loaded_lecture_id"] = lecture_id_value
+        except ValueError:
+            st.error("Lecture ID يجب أن يكون رقمًا صحيحًا موجبًا.")
+        except PermissionError as exc:
+            st.error(str(exc))
+        except requests.RequestException as exc:
+            st.error(f"تعذر الاتصال بـ QUREO. نوع الخطأ: {type(exc).__name__}")
+        except (ValueError, KeyError) as exc:
+            st.error(f"تعذر تحليل محتوى الدرس: {exc}")
+
+if st.session_state.get("qureo_lecture_payload"):
+    render_lecture_payload(st.session_state["qureo_lecture_payload"])
