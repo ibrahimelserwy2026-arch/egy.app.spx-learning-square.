@@ -820,6 +820,7 @@ class QureOHelperApp(App):
         except ValueError as exc:
             self.status.text = str(exc)
             return
+        self._display_questions([])
         self.status.text = "جارٍ قراءة التقدم وتحليل الأسئلة..."
         threading.Thread(
             target=self._scan_worker,
@@ -860,6 +861,7 @@ class QureOHelperApp(App):
         except ValueError:
             self.status.text = "أدخل Cookie وLecture ID صحيحًا."
             return
+        self._display_questions([])
         self.status.text = f"جارٍ تحليل Lecture {lecture_id}..."
         threading.Thread(
             target=self._manual_worker,
@@ -1122,6 +1124,7 @@ class QureOHelperApp(App):
             return
 
         button.disabled = True
+        self.send_all_button.disabled = True
         self.status.text = f"جارٍ إرسال إجابة Talk {question['talk_id']}..."
         threading.Thread(
             target=self._send_worker,
@@ -1158,6 +1161,7 @@ class QureOHelperApp(App):
 
     def _send_finished(self, button: Button, status: str, message: str):
         button.disabled = False
+        self.send_all_button.disabled = not bool(self.submission_entries)
         self.status.text = status
         self.output.text = (self.output.text + "\n\n" + message)[-12000:]
 
